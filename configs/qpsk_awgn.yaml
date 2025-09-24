@@ -1,0 +1,14 @@
+sim:
+  type: baseline_awgn       # <- dispatcher key
+  seed: 1234
+
+tx:
+  M: 4                      # 4 = QPSK, 16 = 16QAM
+  n_bits: 100000
+
+channel:
+  snr_db: 5                 # single-SNR run
+
+io:
+  write_json: true
+  out_json: artifacts/result.json
