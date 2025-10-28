@@ -4,9 +4,9 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Callable, Optional
 import math
 import numpy as np
-
 from . import utils
 from . import ofdm
+from . import fec
 
 # ---------- dataclasses ----------
 
@@ -152,8 +152,8 @@ def autoramp_sc_qpsk_sweep(
     seed: int,
     M: int = 4,
     target_errs: int = 100,
-    min_bits: int = 20_000,
-    max_bits: int = 2_000_000,
+    min_bits: int = 100_000,
+    max_bits: int = 10_000_000,
 ) -> SweepResult:
     rng = utils.get_rng(seed)
     k = int(math.log2(M))
@@ -178,9 +178,9 @@ def autoramp_ofdm_qpsk_sweep(
     cp: float,
     n_subcarriers: int,
     minislot_symbols: int,
-    target_errs: int = 100,
-    min_bits: int = 20_000,
-    max_bits: int = 2_000_000,
+    target_errs: int = 200,
+    min_bits: int = 100_000,
+    max_bits: int = 10_000_000,
 ) -> SweepResult:
     rng = utils.get_rng(seed)
     k = int(math.log2(M))
@@ -201,3 +201,330 @@ def autoramp_ofdm_qpsk_sweep(
         "target_errs": target_errs
     }
     return SweepResult(success=True, meta=meta, points=points)
+
+# --- M2 autoramp (OFDM QPSK over TDL) ---
+from typing import Any, Dict, List, Tuple
+from copy import deepcopy
+from . import simulate
+from .pilots import comb_indices
+
+@dataclass
+class SweepResult:
+    success: bool
+    meta: Dict[str, Any]
+    points: List[SweepPoint]
+
+    @property
+    def snr_db(self): return [p.snr_db for p in self.points]
+    @property
+    def ber_curve(self): return [p.ber for p in self.points]
+    @property
+    def n_bits_curve(self): return [p.n_bits for p in self.points]
+    @property
+    def n_errs_curve(self): return [p.n_errs for p in self.points]
+
+def _bits_per_frame_M2(cfg: Dict[str, Any]) -> int:
+    """Compute DATA bits per frame (payload only) for M2."""
+    ofd   = cfg["ofdm"]; pil = cfg["pilots"]; tx = cfg["tx"]
+    S     = int(ofd["minislot_symbols"])
+    K     = int(ofd["n_subcarriers"])
+    M     = int(tx.get("M", 4))
+    k     = int(round(math.log2(M)))
+    spacing = int(pil["spacing"])
+    offset  = int(pil.get("offset", 0))
+    # number of pilot columns per symbol for comb pattern
+    Kp = len(comb_indices(K, spacing, offset))
+    Kd = K - Kp
+    if Kd <= 0:
+        raise ValueError("No data REs (all-pilot); autoramp M2 requires Kd>0")
+    return S * Kd * k
+
+def autoramp_ofdm_m2_sweep(
+    cfg_base: Dict[str, Any],
+    target_errs: int = 200,
+    min_bits: int = 50_000,
+    max_bits: int = 10_000_000,
+    growth: float = 2.0,
+) -> SweepResult:
+    """
+    Adaptive BER vs SNR for M2 (OFDM+pilots+TDL). Stops at target_errs or N_max per SNR.
+    Uses simulate.run() with single-SNR runs and aggregates BER across repetitions.
+    """
+    cfg0 = deepcopy(cfg_base)
+    sim   = cfg0.get("sim", {})
+    ch    = cfg0.get("channel", {})
+    snr_list = list(ch["snr_db_list"])
+    seed0 = int(sim.get("seed", 1234))
+    rng_run = utils.get_rng(seed0)   # one RNG for the whole autoramp sweep
+    bits_per_frame = _bits_per_frame_M2(cfg0)
+
+    points: List[SweepPoint] = []
+
+    for idx, snr in enumerate(snr_list):
+        total_bits = 0
+        total_errs = 0
+        n_bits_try = max(min_bits, bits_per_frame)
+
+        rep = 0
+        while total_bits < max_bits and total_errs < target_errs:
+            cfg = deepcopy(cfg0)
+            # single SNR run
+            cfg["channel"]["snr_db_list"] = [float(snr)]
+            # grow n_bits each repetition, but simulate.py will round/pad to whole frames
+            cfg["tx"]["n_bits"] = int(n_bits_try)
+            # vary seed so repetitions are independent
+            cfg["sim"]["seed"] = int(rng_run.integers(0, 2**31 - 1))
+            # Disable plotting & JSON during inner autoramp reps
+            cfg.setdefault("io", {})["plot"] = False
+            cfg["io"]["show_plot"] = False
+            cfg["io"]["write_json"] = False
+
+            res = simulate.run(cfg)  # expects "ber": [value] for this single SNR
+            ber = float(res["ber"][0])
+
+            # infer evaluated bits = full frames worth (simulate pads/wraps)
+            frames = int(math.ceil(n_bits_try / bits_per_frame))
+            eval_bits = frames * bits_per_frame
+            errs = int(round(ber * eval_bits))
+
+            total_bits += eval_bits
+            total_errs += errs
+
+            # increase trial size for next repetition if needed
+            if total_errs < target_errs and total_bits < max_bits:
+                n_bits_try = int(min(max_bits - total_bits, max(n_bits_try * growth, bits_per_frame)))
+            rep += 1
+
+            # avoid infinite loop if ber==0 persistently: let it hit the max_bits cap
+
+        # Final BER estimate (or upper bound if 0 errors)
+        if total_errs > 0:
+          ber_hat = total_errs / total_bits
+        else:
+          ber_hat = 0.0    # keep field for backwards-compat
+        #  ber_ub  = 1.0 / max(total_bits, 1)  # optional: add this in the result dict
+
+        points.append(SweepPoint(snr_db=float(snr), n_bits=total_bits, n_errs=total_errs, ber=ber_hat))
+
+    meta = {
+        "mode": "ofdm_m2",
+        "seed": seed0,
+        "target_errs": target_errs,
+        "min_bits": min_bits,
+        "max_bits": max_bits,
+        "growth": growth,
+        "bits_per_frame": bits_per_frame,
+    }
+    return SweepResult(success=True, meta=meta, points=points)
+
+# ----------------------------- S2: BLER over SNR (with TDL/CDL) ----------------------------- #
+from . import ofdm, utils, pilots as pilots_mod, equalize as eq, interp as interp_mod, channel
+
+def _align_up(x: int, m: int) -> int:
+    if m <= 0: return x
+    r = x % m
+    return x if r == 0 else (x + (m - r))
+
+def bler_ofdm_sweep(cfg: dict) -> dict:
+    """BLER vs SNR using TB+CRC over the OFDM+pilots+ZF pipeline with TDL/CDL."""
+    import numpy as np
+    from .tb import append_crc, check_crc, bytes_to_bits, bits_to_bytes
+
+    sim = cfg.get("sim", {}); tx = cfg.get("tx", {}); of = cfg.get("ofdm", {})
+    nr  = cfg.get("nr", {});   ch = cfg.get("channel", {}); pil = cfg.get("pilots", {})
+    io  = cfg.get("io", {});   urc = cfg.get("urllc", {})
+
+    rng_seed = int(sim.get("seed", 0)); rng = utils.get_rng(rng_seed)
+
+    M = int(tx.get("M", 4)); k = int(np.log2(M))
+    nfft = int(of.get("nfft", 256)); cp = float(of.get("cp", 0.125))
+    K = int(of.get("n_subcarriers", 120)); Lslot = int(of.get("minislot_symbols", nr.get("minislot_symbols", 7)))
+    Ncp = int(round(cp * nfft))
+
+    spacing = int(pil.get("spacing", 4)); offset = int(pil.get("offset", 0))
+    pseed = int(pil.get("seed", 123)); boost = float(pil.get("power_boost_db", 0.0))
+    pmode = str(pil.get("power_mode", "unconstrained"))
+
+    app_bytes = int(urc.get("app_payload_bytes", 32) or 32)
+    tb_bytes = int(urc.get("tb_payload_bytes", app_bytes + 16))
+
+    snr_list = ch.get("snr_db_list", [0, 2, 4, 6, 8, 10])
+    packets_per_snr = int(cfg.get("bler", {}).get("packets_per_snr", 400))
+    min_errors = int(cfg.get("bler", {}).get("min_errors", 20))
+
+    tmp = np.zeros((1, K), dtype=np.complex64)
+    _grid1, pilot_mask1, pilot_vals1, data_Es1, pilot_Es1 = pilots_mod.place(
+        tmp, spacing, offset=offset, seed=pseed, power_boost_db=boost, power_mode=pmode
+    )
+    pilots_per_sym = int(pilot_mask1[0].sum()); data_RE_per_sym = K - pilots_per_sym
+    if data_RE_per_sym <= 0:
+        raise RuntimeError("Pilot pattern leaves no data REs")
+
+    bler = []; packets = []
+    for i_snr, snr_db in enumerate(snr_list):
+
+        model = str(ch.get("model", "tdl")).lower()
+        if model == "tdl":
+            prof = ch.get("tdl", {})
+            delays = prof.get("delays", [0,3,5])
+            powers_db = prof.get("powers_db", [0.0, -3.0, -6.0])
+            h_fir = channel.tdl_fir_from_profile(delays, powers_db, rng=rng)
+        elif model == "cdl":
+            prof = ch.get("cdl", {})
+            profile_name = str(prof.get("profile", "C")).upper()
+            scale_samples = int(prof.get("scale_samples", 0)) or None
+            k_db = prof.get("k_db", None)
+            k_db = float(k_db) if k_db is not None else None
+            h_fir = channel.cdl_fir(profile=profile_name, ncp=Ncp, scale_samples=scale_samples, rice_k_db=k_db, rng=rng)
+        else:
+            h_fir = np.array([1.0+0j], dtype=np.complex64)
+
+        if (len(h_fir) - 1) > Ncp:
+            raise ValueError(f"CP too short: L-1={len(h_fir)-1} > Ncp={Ncp}")
+
+        n_fail = 0; n_sent = 0
+        while n_sent < packets_per_snr and n_fail < min_errors:
+            payload = rng.integers(0, 256, size=tb_bytes, dtype=np.uint8).tobytes()
+            tb = append_crc(payload); tb_bits = bytes_to_bits(tb); Lbits = len(tb_bits)
+            # --- FEC encode (optional) ---
+            fec_cfg = cfg.get('fec', {})
+            code_bits, fec_meta = fec.encode(tb_bits, fec_cfg)
+            Lcode = int(code_bits.size)
+
+            data_bits_per_sym = data_RE_per_sym * k
+            n_syms_est = int(np.ceil(Lcode / max(1, data_bits_per_sym)))
+            n_syms = ( ( (n_syms_est + Lslot - 1) // Lslot ) * Lslot ) if Lslot > 1 else n_syms_est
+
+            base = np.zeros((n_syms, K), dtype=np.complex64)
+            _grid, pilot_mask, pilot_vals, data_Es, pilot_Es = pilots_mod.place(
+                base, spacing, offset=offset, seed=pseed, power_boost_db=boost, power_mode=pmode
+            )
+            data_mask = ~pilot_mask
+            capacity_bits = int(np.sum(data_mask)) * k
+            if capacity_bits < Lcode:
+                add = Lslot if Lslot > 1 else 1
+                n_syms2 = n_syms + add
+                base = np.zeros((n_syms2, K), dtype=np.complex64)
+                _grid, pilot_mask, pilot_vals, data_Es, pilot_Es = pilots_mod.place(
+                    base, spacing, offset=offset, seed=pseed, power_boost_db=boost, power_mode=pmode
+                )
+                data_mask = ~pilot_mask
+                n_syms = n_syms2
+                capacity_bits = int(np.sum(data_mask)) * k
+
+            pad = capacity_bits - Lcode
+            bits_tx = np.pad(code_bits, (0, pad), constant_values=0) if pad > 0 else code_bits
+            syms_data = utils.mod(bits_tx, M).reshape(-1)
+
+            tx_grid = pilot_vals.astype(np.complex64)
+            tx_grid[data_mask] = syms_data[: int(np.sum(data_mask))]
+
+            x = ofdm.tx(tx_grid, nfft=nfft, cp=cp, n_subcarriers=K)
+            y_c = channel.apply_fir_per_symbol(x, h_fir)
+
+            sigma_RI = utils.ebn0_db_to_sigma_ofdm_time(
+                snr_db, M=M, code_rate=fec.get_rate(fec_cfg), nfft=nfft, ifft_norm="numpy", Es_sub=1.0
+            )
+
+            # New noise on each HARQ attempt
+            noise = rng.normal(0.0, sigma_RI, y_c.shape) + 1j * rng.normal(0.0, sigma_RI, y_c.shape)
+            y = y_c + noise
+
+            # Receiver per attempt
+            Y = ofdm.rx(y, nfft=nfft, cp=cp, n_subcarriers=K)
+
+            # Channel estimation using pilots (noise-affected per attempt)
+            H_p = np.zeros_like(Y, dtype=np.complex64)
+            mask = pilot_mask
+            H_p[mask] = (Y[mask] / (pilot_vals[mask] + 1e-12)).astype(np.complex64)
+            H_est = interp_mod.interp_freq_linear(H_p, mask)
+            H_est = interp_mod.smooth_time_triangular(H_est)
+
+            # MMSE equalization
+            sigma2 = float(2.0 * (sigma_RI ** 2))  # complex noise variance
+            Y_eq = eq.equalize_mmse_robust(Y, H_est, float(sigma2), 1e-12)
+
+            # Equalized data symbols
+            y_data = Y_eq[data_mask].reshape(-1)
+
+
+            # --- Timely BLER + HARQ (Chase) with soft LLR + soft LDPC ---
+            from . import nr_timing
+            from .tb import bits_to_bytes
+
+            # Numerology and timing (use your existing key scheme)
+            mu = int(cfg.get('nr', {}).get('mu', cfg.get('numerology', {}).get('mu', 2)))
+            Lsym = int(
+                cfg.get('nr', {}).get('minislot_symbols',
+                cfg.get('numerology', {}).get('L_symbols',
+                cfg.get('ofdm', {}).get('minislot_symbols', 7)))
+            )
+            cp_frac = float(cfg.get('ofdm', {}).get('cp', cfg.get('numerology', {}).get('cp_fraction', 0.125)))
+            tti_ms = nr_timing.minislot_tti_ms(mu, Lsym, cp_frac)
+
+            # URLLC block (accept both deadline_ms and radio_deadline_ms)
+            urllc_cfg   = cfg.get('urllc', {}) or {}
+            deadline_ms = float(urllc_cfg.get('deadline_ms', urllc_cfg.get('radio_deadline_ms', 8.0)))
+
+            # HARQ settings (accept under urllc.harq or nr.harq)
+            harq_cfg     = dict(urllc_cfg.get('harq') or cfg.get('nr', {}).get('harq') or {})
+            harq_enabled = bool(harq_cfg.get('enabled', False))
+            max_retx     = int(harq_cfg.get('max_retx', 0))          # extra attempts allowed
+            combining    = str(harq_cfg.get('combining', 'none')).lower()
+
+            attempts = 0
+            elapsed  = 0.0
+            ok = False
+            _llr_acc = None
+            m_bits   = int(np.log2(M))
+
+            while True:
+                attempts += 1
+
+                # Post-eq noise variance per complex symbol for LLRs.
+                # (sigma_RI is your per-real/imag std you already computed for AWGN)
+                sigma2_llr = float(sigma_RI ** 2)
+
+                # Soft LLRs from equalized symbols (trim to coded length)
+                llr_cur = utils.qam_llr_maxlog(y_data, M, sigma2=sigma2_llr)
+                llr_cur = llr_cur[: Lcode * m_bits]
+
+                # HARQ Chase combining (LLR addition)
+                if harq_enabled and combining == "chase":
+                    _llr_acc = llr_cur if _llr_acc is None else (_llr_acc + llr_cur)
+                    use_llr  = _llr_acc
+                else:
+                    use_llr  = llr_cur
+
+                # Soft-decision LDPC (min-sum) via fec.decode_soft; falls back for none/repeat
+                dec_bits = fec.decode_soft(use_llr, fec_cfg, meta=fec_meta, info_len=Lbits)
+                tb_rx    = bits_to_bytes(dec_bits)
+                ok_now   = check_crc(tb_rx)
+
+                # Timeliness check
+                elapsed += tti_ms
+                if ok_now and (elapsed <= deadline_ms):
+                    ok = True
+                    break
+
+                # Stop if no HARQ, retries exhausted, or deadline reached
+                if (not harq_enabled) or (attempts > (max_retx + 1)) or (elapsed >= deadline_ms):
+                    break
+
+            # Update counters after the HARQ/Deadline loop
+            if not ok:
+                n_fail += 1
+            n_sent += 1
+            # --- end timely BLER block ---
+
+
+        bler.append(n_fail / float(max(n_sent,1)))
+        packets.append(n_sent)
+
+    meta = {
+        "mode": "tb_bler", "seed": rng_seed, "M": M, "nfft": nfft, "cp": cp, "n_subcarriers": K,
+        "minislot_symbols": Lslot, "pilot_spacing": spacing, "pilot_offset": offset, "pilot_seed": pseed,
+        "pilot_power_boost_db": boost, "pilot_power_mode": pmode, "tb_payload_bytes": tb_bytes,
+        "packets_per_snr": packets_per_snr, "min_errors": min_errors, "channel_model": ch.get("model", "tdl")
+    }
+    return {"success": True, "snr_db": list(map(float, snr_list)), "bler": bler, "packets": packets, "meta": meta}

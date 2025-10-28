@@ -4,9 +4,20 @@ from typing import Union, Sequence
 from math import erf, erfc
 
 def get_rng(seed: int | None):
+    """Return a reproducible Generator with a seed safely coerced to uint32.
+    Accepts arbitrary inputs (None, int, float, str); clamps to [0, 2**32-1].
+    """
     if seed is None:
         return np.random.default_rng()
-    return np.random.default_rng(int(seed))
+    try:
+        s = int(seed)
+    except Exception:
+        # Fallback: hash arbitrary inputs deterministically
+        s = abs(hash(str(seed)))
+    # Clamp to valid range for SeedSequence/PCG64
+    s = int(s) % (2**32 - 1)
+    return np.random.default_rng(np.uint32(s))
+
 
 def complex_exp(theta: Union[float, np.ndarray, Sequence],
                 dtype: np.dtype | None = None) -> np.ndarray:
@@ -178,3 +189,49 @@ def ber_qpsk_theory(ebn0_db):
 def erfc_vec(x):
     return _erfc_vec(x)
 # ---------------------------------------------------------------------------
+
+# --- Soft LLRs for Gray square QAM (max-log) ---
+
+def _gray_bits(M):
+    m = int(np.log2(M))
+    vals = np.arange(M, dtype=int) ^ (np.arange(M, dtype=int) >> 1)
+    return ((vals[:, None] >> np.arange(m)[::-1]) & 1).astype(np.uint8)
+
+def _qam_constellation(M):
+    if M == 2:  # BPSK
+        const = np.array([-1.0, +1.0]) + 0j
+        Es = 1.0
+        bits = _gray_bits(2)
+        return const.astype(np.complex128), bits
+    m = int(np.log2(M))
+    K = 2 ** (m // 2)
+    pam = np.arange(K) * 2 - (K - 1)              # ...,-3,-1,1,3,...
+    g = np.arange(K) ^ (np.arange(K) >> 1)        # Gray reorder
+    pam_g = pam[g]
+    xv, yv = np.meshgrid(pam_g, pam_g[::-1])
+    const = (xv + 1j * yv).reshape(-1)
+    Es = np.mean(np.abs(const) ** 2)
+    const = const / np.sqrt(Es)                   # normalize Es=1
+    bits = _gray_bits(M)
+    return const.astype(np.complex128), bits
+
+def qam_llr_maxlog(sym_eq: np.ndarray, M: int, sigma2: float) -> np.ndarray:
+    """
+    Max-log LLRs per coded bit.
+    sym_eq: equalized symbols, shape (N,)
+    M: constellation size
+    sigma2: noise variance per complex symbol (post-equalization)
+    returns shape (N*log2(M),)
+    """
+    const, bits = _qam_constellation(M)     # (M,), (M,m)
+    m = bits.shape[1]
+    y = sym_eq.reshape(-1, 1)               # (N,1)
+    d2 = np.abs(y - const.reshape(1, -1)) ** 2
+    llrs = []
+    for b in range(m):
+        mask0 = (bits[:, b] == 0)
+        mask1 = ~mask0
+        d0 = np.min(d2[:, mask0], axis=1)
+        d1 = np.min(d2[:, mask1], axis=1)
+        llrs.append((d1 - d0) / (2.0 * max(sigma2, 1e-12)))
+    return np.stack(llrs, axis=1).reshape(-1)

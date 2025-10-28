@@ -1,32 +1,29 @@
 sim:
-  type: ofdm_m2
+  type: ofdm_awgn
   seed: 1234
+  autoramp: true
 tx:
   M: 4
-  n_bits: 6400
 ofdm:
   nfft: 256
   cp: 0.125
   n_subcarriers: 64
   minislot_symbols: 4
-pilots:
-  spacing: 1
-  offset: 0
-  seed: 999
-  power_boost_db: 0.0
-  power_mode: constrained
 channel:
-  model: flat
   snr_db_list:
   - 0
+  - 2
   - 4
+  - 6
   - 8
-  - 12
-eq:
-  type: zf
+  - 10
+autoramp:
+  target_errs: 100
+  min_bits: 20000
+  max_bits: 2000000
 io:
   write_json: true
-  out_json: artifacts/m2_flat_allpilot.json
+  out_json: artifacts/m1_ofdm_awgn_results.json
 urllc:
   five_qi: 85
   core_budget_ms: 2.0

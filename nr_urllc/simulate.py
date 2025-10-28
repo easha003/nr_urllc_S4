@@ -10,6 +10,55 @@ from . import pilots as pilots_mod
 from . import metrics as metrics_mod
 from . import equalize as eq
 from .utils import qfunc
+from nr_urllc import interp as interp_mod
+from nr_urllc.plots import plot_m2_curves, plot_ofdm_awgn_ber
+
+# --- SNR list parser: accepts list, single, CSV string, or "start:step:stop" ---
+def _get_snr_db_list(ch_cfg) -> list[float]:
+    """
+    Supports:
+      snr_db_list: [0,2,4,6]   | "0,2,4,6"  | "0:2:16"
+      snr_db: 6.0               | [6,8,10]
+    """
+    if ch_cfg is None:
+        return [0.0, 5.0, 10.0]
+
+    def as_list(v):
+        import numpy as _np
+        if isinstance(v, (list, tuple, _np.ndarray)):
+            return [float(x) for x in v]
+        if isinstance(v, (int, float)):
+            return [float(v)]
+        if isinstance(v, str):
+            s = v.strip()
+            if ":" in s:
+                parts = [p.strip() for p in s.split(":")]
+                if len(parts) == 3:
+                    a, step, b = map(float, parts)
+                    if step == 0: return [a]
+                    n = int(_np.floor((b - a) / step)) + 1
+                    return [a + i * step for i in range(max(1, n))]
+            if "," in s:
+                return [float(x.strip()) for x in s.split(",") if x.strip() != ""]
+            try:
+                return [float(s)]
+            except Exception:
+                return []
+        return []
+
+    if "snr_db_list" in ch_cfg:
+        lst = as_list(ch_cfg["snr_db_list"])
+        return lst if lst else [0.0, 5.0, 10.0]
+    if "snr_db" in ch_cfg:
+        lst = as_list(ch_cfg["snr_db"])
+        return lst if lst else [float(ch_cfg["snr_db"])]
+    return [0.0, 5.0, 10.0]
+
+
+
+# --- Autoramp controller + fixed-σ² MMSE (drop-in helpers) ---
+from nr_urllc.autoramp import AutorampController
+from .equalize import mmse_equalize
 
 
 def _write_json(maybe: bool, path: str, obj: dict):
@@ -20,7 +69,6 @@ def _write_json(maybe: bool, path: str, obj: dict):
 
 
 # ---------------------------- M0: Baseline AWGN ---------------------------- #
-
 def run_baseline_awgn(cfg: dict) -> dict:
     """
     Baseline bit-level AWGN simulation (no OFDM).
@@ -91,7 +139,7 @@ def _run_ofdm_awgn_cfg(cfg: dict) -> dict:
     _     = int(of.get("n_symbols", 14))             # not directly used here
     L_ms  = int(of.get("minislot_symbols", 4))       # {2,4,7} typical
 
-    ebn0_list = ch.get("snr_db_list", [0, 5, 10])
+    ebn0_list = _get_snr_db_list(ch)
 
     # Bits -> QAM (unit Es) -> grid with whole rows
     n_syms_needed = (n_bits // k + n_sc - 1) // n_sc
@@ -147,7 +195,15 @@ def _run_ofdm_awgn_cfg(cfg: dict) -> dict:
         "ber_curve": out_curve,
     }
     _write_json(bool(io.get("write_json", False)), io.get("out_json", "artifacts/ofdm_result.json"), out)
+    # Auto-plot if requested
+    if io.get("plot", False):
+        label = f"M={M} OFDM/AWGN"
+        out_png = io.get("out_plot", "artifacts/ofdm_awgn_ber.png")
+        plot_ofdm_awgn_ber(out, label=label, title="M1 — BER vs SNR (OFDM over AWGN)",
+                       save_path=out_png, show=bool(io.get("show_plot", False)))
+
     return out
+
 
 def run_ofdm_awgn(snrs_or_cfg, M: int = 4):
     """
@@ -162,18 +218,15 @@ def run_ofdm_awgn(snrs_or_cfg, M: int = 4):
     if isinstance(snrs_or_cfg, dict):
         return _run_ofdm_awgn_cfg(snrs_or_cfg)
 
-
     def _ber_theory_mqam(ebn0_db: float, M: int) -> float:
          """
          Approx BER for square M-QAM in AWGN (Gray):
          - QPSK (M=4): Pb = 0.5 * erfc(sqrt(Eb/N0))
          - M>4: Pb ≈ (4/k) * (1 - 1/sqrt(M)) * Q( sqrt(3k/(M-1) * Eb/N0) )
          """
-
          ebn0 = 10.0 ** (ebn0_db / 10.0)
          if M == 4:
             return float(0.5 * m.erfc(np.sqrt(ebn0)))
-        
          k = int(np.log2(M))
          return float((4.0 / k) * (1.0 - 1.0 / np.sqrt(M)) * qfunc(np.sqrt(3.0 * k / (M - 1) * ebn0)))
 
@@ -182,37 +235,27 @@ def run_ofdm_awgn(snrs_or_cfg, M: int = 4):
         out[float(snr_db)] = _ber_theory_mqam(float(snr_db), int(M))
     return out
 
-# ROBUST HELPER FUNCTIONS
-# Add these functions to your simulate.py file
 
+# --------------------------- ROBUST HELPERS (LS/Interp) -------------------- #
 def estimate_ls_robust(Y_used: np.ndarray, pilot_vals: np.ndarray, pilot_mask: np.ndarray) -> np.ndarray:
     """
     ROBUST LS estimation with numerical protection and pilot power handling.
     """
-    eps = 1e-10  # Stronger numerical protection
+    eps = 1e-10
     H = np.full_like(Y_used, np.nan, dtype=np.complex64)
-    
-    # Get pilot positions
-    pilot_positions = pilot_mask
-    
-    if not np.any(pilot_positions):
+
+    if not np.any(pilot_mask):
         raise ValueError("No pilots found for channel estimation")
-    
-    # Extract pilot symbols
-    Xp = pilot_vals[pilot_positions]
-    Yp = Y_used[pilot_positions]
-    
-    # Robust LS estimation with power normalization check
+
+    Xp = pilot_vals[pilot_mask]
+    Yp = Y_used[pilot_mask]
+
     pilot_power = np.mean(np.abs(Xp)**2)
     if pilot_power < eps:
         raise ValueError("Pilot power too low")
-    
-    # LS estimate: H = Y/X
+
     H_pilot = Yp / (Xp + eps)
-    
-    # Store estimates
-    H[pilot_positions] = H_pilot
-    
+    H[pilot_mask] = H_pilot
     return H
 
 
@@ -222,232 +265,293 @@ def interpolate_freq_robust(H_pilot: np.ndarray, pilot_mask: np.ndarray, K: int)
     """
     S, K_check = H_pilot.shape
     assert K_check == K, f"Dimension mismatch: {K_check} != {K}"
-    
+
     k_indices = np.arange(K, dtype=float)
     H_est = np.zeros_like(H_pilot, dtype=np.complex64)
-    
+
     for s in range(S):
         pilot_cols = np.where(pilot_mask[s])[0]
-        
         if len(pilot_cols) == 0:
             raise ValueError(f"No pilots in OFDM symbol {s}")
         elif len(pilot_cols) == 1:
-            # Single pilot: constant extrapolation
             H_est[s, :] = H_pilot[s, pilot_cols[0]]
         else:
-            # Multiple pilots: linear interpolation with edge extrapolation
             pilot_values = H_pilot[s, pilot_cols]
-            
-            # Linear interpolation
             H_real = np.interp(k_indices, pilot_cols.astype(float), pilot_values.real)
             H_imag = np.interp(k_indices, pilot_cols.astype(float), pilot_values.imag)
             H_est[s, :] = (H_real + 1j * H_imag).astype(np.complex64)
-    
+
     return H_est
 
 
-def equalize_zf_robust(Y: np.ndarray, H_est: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """
-    ROBUST Zero-Forcing equalizer with better numerical protection.
-    """
-    # Stronger protection against division by zero
-    H_mag = np.abs(H_est)
-    
-    # Apply ZF only where channel is significant
-    strong_channel = H_mag > eps
-    
-    Y_eq = np.zeros_like(Y, dtype=np.complex64)
-    Y_eq[strong_channel] = Y[strong_channel] / H_est[strong_channel]
-    
-    # For weak channels, pass through (better than amplifying noise)
-    Y_eq[~strong_channel] = Y[~strong_channel]
-    
-    return Y_eq
-
-
-def equalize_mmse_robust(Y: np.ndarray, H_est: np.ndarray, noise_var: float, eps: float = 1e-10) -> np.ndarray:
-    """
-    ROBUST MMSE equalizer with careful noise variance handling.
-    """
-    if noise_var <= 0:
-        # Fallback to ZF if noise variance is invalid
-        return equalize_zf_robust(Y, H_est)
-    
-    # MMSE gain: G = H* / (|H|^2 + σ²)
-    H_conj = np.conj(H_est)
-    H_mag_sq = np.abs(H_est)**2
-    
-    # Robust denominator
-    denominator = H_mag_sq + noise_var + eps
-    
-    # MMSE gain
-    G = H_conj / denominator
-    
-    return (G * Y).astype(np.complex64)
-
-
+# --------------------------------- M2 -------------------------------------- #
 def run_ofdm_m2(cfg: dict) -> dict:
     """
-    ROBUST M2: OFDM with pilots, channel estimation, and equalization.
-    
-    This version addresses the key issues:
-    1. Proper pilot density and power
-    2. Robust channel estimation 
-    3. Correct noise variance for MMSE
-    4. Better interpolation handling
+    M2: OFDM with comb pilots, LS/MMSE estimation, TDL/flat channel & ZF/MMSE EQ.
+
+    This version applies the autoramp fixes:
+      • Autoramp stop requires: (errors >= target_errs) AND (used_REs >= R_min) AND (bits >= min_bits_eff),
+        with a hard max_bits guard.
+      • Fixed σ² for MMSE derived from Eb/N0 + k + η (no residual blending).
+      • RNGs are seeded once per SNR; channel can be held constant across frames.
     """
+    # --- Shorthands / config ---
     sim = cfg.get("sim", {})
-    tx = cfg.get("tx", {})
-    of = cfg.get("ofdm", {})
-    ch = cfg.get("channel", {})
+    tx  = cfg.get("tx", {})
+    of  = cfg.get("ofdm", {})
+    ch  = cfg.get("channel", {})
     pil = cfg.get("pilots", {})
-    eqcfg = cfg.get("eq", {})
-    io = cfg.get("io", {})
+    eqc = cfg.get("eq", {})
+    io  = cfg.get("io", {})
 
-    rng = utils.get_rng(sim.get("seed"))
-    M = int(tx.get("M", 4))
-    k = int(np.log2(M))
-    n_bits = int(tx.get("n_bits", 120_000))
+    rng   = utils.get_rng(sim.get("seed"))
+    M     = int(tx.get("M", 4))
+    k     = int(np.log2(M))
+    nfft  = int(of.get("nfft", 256))
+    cp    = float(of.get("cp", 0.125))
+    K     = int(of.get("n_subcarriers", 64))
+    S     = int(of.get("minislot_symbols", 4))
+    Ncp   = int(round(cp * nfft))
 
-    nfft = int(of.get("nfft", 256))
-    cp = float(of.get("cp", 0.125))
-    K = int(of.get("n_subcarriers", 64))
-    L_ms = int(of.get("minislot_symbols", 4))
-    Ncp = int(round(cp * nfft))
+    spacing    = int(pil.get("spacing", 4))
+    offset     = int(pil.get("offset", 0))
+    pil_seed   = int(pil.get("seed", sim.get("seed", 0)))
+    pil_boost  = float(pil.get("power_boost_db", 3.0))
+    power_mode = str(pil.get("power_mode", "unconstrained")).lower()
 
-    # IMPROVED: Better pilot configuration
-    spacing = int(pil.get("spacing", 4))
-    offset = int(pil.get("offset", 0))
-    pil_seed = int(pil.get("seed", sim.get("seed", 0)))
-    pil_boost = float(pil.get("power_boost_db", 3.0))  # Default 3dB boost
+    ebn0_list = _get_snr_db_list(ch)
+    eq_type   = str(eqc.get("type", "zf")).lower()
 
-    ebn0_list = ch.get("snr_db_list", [0, 5, 10])
-    eq_type = str(eqcfg.get("type", "zf")).lower()
+    # --- Output containers ---
+    out = {
+        "snr_db": [],
+        "ber": [],
+        "evm_percent": [],
+        "mse_H": [],
+        "bits_per_frame": None,  # filled after first chunk
+    }
 
-    # Generate transmit data
-    n_syms_needed = (n_bits // k + K - 1) // K
-    n_bits_eff = n_syms_needed * K * k
-    bits = rng.integers(0, 2, n_bits_eff)
-    syms = utils.mod(bits, M).astype(np.complex64)
-    grid = syms.reshape(n_syms_needed, K)
-
-    use_syms = min(L_ms, grid.shape[0])
-    grid = grid[:use_syms]
-
-    # Insert pilots with proper power
-    tx_grid, pilot_mask, pilot_vals = pilots_mod.place(
-        grid, spacing, offset=offset, seed=pil_seed, power_boost_db=pil_boost
-    )
-
-    # OFDM TX
-    x_time = ofdm.tx(tx_grid, nfft=nfft, cp=cp)
-
-    # Channel setup
-    model = str(ch.get("model", "tdl")).lower()
-    if model == "flat":
-        h_flat = channel.flat_rayleigh(S=x_time.shape[0], rng=rng)
-        y_time_nominal = (h_flat[:, None] * x_time).astype(np.complex64)
-        h_freq = np.tile(h_flat[:, None], (1, K)).astype(np.complex64)
-    elif model == "tdl":
-        prof = ch.get("tdl", {})
-        delays = prof.get("delays", [0, 3, 5])
-        powers_db = prof.get("powers_db", [0.0, -4.0, -8.0])
-        
-        # ROBUST: Ensure proper power normalization
-        powers_linear = 10**(np.array(powers_db) / 10.0)
-        powers_linear = powers_linear / powers_linear.sum()
-        
-        h = channel.tdl_fir_from_profile(delays, powers_db, rng=rng)
-        
-        # Verify CP adequacy
-        if (len(h) - 1) > Ncp:
-            raise ValueError(f"CP too short for TDL: L-1={len(h)-1} > Ncp={Ncp}")
-        
-        y_time_nominal = channel.apply_fir_per_symbol(x_time, h)
-        
-        # True channel response in frequency domain
-        H_full = np.fft.fft(h, n=nfft).astype(np.complex64)
-        used_bins = ofdm.get_used_bins(nfft, n_used=K, skip_dc=True)
-        h_freq = np.tile(H_full[used_bins], (x_time.shape[0], 1)).astype(np.complex64)
-    else:
-        raise ValueError("channel.model must be 'flat' or 'tdl'")
-
-    # SNR sweep
-    out = {"snr_db": [], "ber": [], "evm_percent": [], "mse_H": []}
-
+    # --- SNR sweep ---
     for ebn0_db in ebn0_list:
-        # ROBUST: Careful noise addition
-        sigma_RI = utils.ebn0_db_to_sigma_ofdm_time(
-            ebn0_db, M=M, code_rate=1.0, nfft=nfft, ifft_norm="numpy", Es_sub=1.0
-        )
+
+        # Independent RNGs per SNR (seed once per SNR)
+        seed0   = int(sim.get("seed", 0))
+        snr_tag = int(round(100 * float(ebn0_db)))
+
+        rng_data  = utils.get_rng(seed0 + 4242 + snr_tag)   # bits
+        rng_noise = utils.get_rng(seed0 +  100 + snr_tag)   # AWGN
+        chan_seed = int(ch.get("seed", seed0))              # prefer channel.seed if provided
+        rng_chan  = utils.get_rng(chan_seed + 777)          # channel draw (constant over SNR if seed fixed)
+
+        # Build the channel once per SNR (held constant within this sweep)
         
-        noise = (rng.normal(scale=sigma_RI, size=x_time.shape) + 
-                1j * rng.normal(scale=sigma_RI, size=x_time.shape)).astype(np.complex64)
-        y_time = (y_time_nominal + noise).astype(np.complex64)
+        model = str(ch.get("model", "tdl")).lower()
+        H_full = None
+        used_bins = None
+        h_fir = None
 
-        # OFDM RX
-        Y = ofdm.rx(y_time, nfft=nfft, cp=cp, n_subcarriers=K, return_full_grid=False)
+        if model == "tdl":
+            prof      = ch.get("tdl", {})
+            delays    = prof.get("delays", [0, 3, 5])
+            powers_db = prof.get("powers_db", [0.0, -4.0, -8.0])
 
-        # ROBUST: Channel estimation with averaging
-        H_p = estimate_ls_robust(Y, pilot_vals, pilot_mask)
-        H_est = interpolate_freq_robust(H_p, pilot_mask, K)
+            h_fir = channel.tdl_fir_from_profile(delays, powers_db, rng=rng_chan)
 
-        # ROBUST: Equalization
-        if eq_type == "mmse":
-            # Conservative noise variance estimate
-            ebn0_linear = 10**(ebn0_db / 10.0)
-            esn0_linear = ebn0_linear * np.log2(M)
-            
-            # Account for pilot boost in noise estimation
-            pilot_boost_linear = 10**(pil_boost / 10.0)
-            
-            # Frequency-domain noise variance (conservative)
-            noise_var = 1.0 / esn0_linear
-            
-            Y_eq = equalize_mmse_robust(Y, H_est, noise_var)
+            if (len(h_fir) - 1) > Ncp:
+                raise ValueError(f"CP too short for TDL: L-1={len(h_fir)-1} > Ncp={Ncp}")
+
+            H_full    = np.fft.fft(h_fir, n=nfft).astype(np.complex64)
+            used_bins = ofdm.get_used_bins(nfft, n_used=K, skip_dc=True)
+
+        elif model == "cdl":
+            prof = ch.get("cdl", {})
+            profile_name = str(prof.get("profile", "C")).upper()
+            # Option 1: explicitly set scale in samples (maps normalized delays -> samples)
+            scale_samples = int(prof.get("scale_samples", 0)) or None
+            # Option 2: specify Ricean K [dB] for the strongest tap (useful for CDL-D/E-like LOS)
+            k_db = prof.get("k_db", None)
+            if k_db is not None:
+                try:
+                    k_db = float(k_db)
+                except Exception:
+                    k_db = None
+
+            h_fir = channel.cdl_fir(profile=profile_name, ncp=Ncp, scale_samples=scale_samples, rice_k_db=k_db, rng=rng_chan)
+
+            if (len(h_fir) - 1) > Ncp:
+                raise ValueError(f"CP too short for CDL({profile_name}): L-1={len(h_fir)-1} > Ncp={Ncp}")
+
+            H_full    = np.fft.fft(h_fir, n=nfft).astype(np.complex64)
+            used_bins = ofdm.get_used_bins(nfft, n_used=K, skip_dc=True)
+
+        elif model == "flat":
+            # nothing precomputed; will draw per-symbol taps below if desired
+            pass
         else:
-            Y_eq = equalize_zf_robust(Y, H_est)
+            raise ValueError("channel.model must be 'flat', 'tdl', or 'cdl'")
+        # --- Autoramp controller (fair across M) ---
+        ctrl = AutorampController(cfg, M=M, nfft=nfft, cp_frac=cp)
+        ctrl.reset_counters()
 
-        # ROBUST: Performance evaluation
-        data_mask = pilots_mod.data_mask_from_pilots(pilot_mask)
-        if np.any(data_mask):
-            use_mask = data_mask
-            ref_syms = tx_grid[use_mask]
-        else:
-            # All-pilot case
-            use_mask = pilot_mask
-            ref_syms = pilot_vals[use_mask]
+        # --- Accumulators for metrics (per SNR) ---
+        evm_num = 0.0
+        evm_den = 0.0
+        mse_sum = 0.0
+        n_chunks = 0
+        bits_per_frame = None
 
-        # Demodulate and compute BER
-        dec_bits = utils.demod(Y_eq[use_mask], M)
-        tx_bits = utils.demod(ref_syms, M)
-        ber = float(np.mean(dec_bits != tx_bits))
+        # --- Autoramp loop (no fixed bit budget here) ---
+        while True:
+            # --- One mini-slot of QAM data (S x K) ---
+            bits_chunk = rng_data.integers(0, 2, S * K * k, dtype=np.int8)
+            syms_chunk = utils.mod(bits_chunk, M).astype(np.complex64)
+            grid_chunk = syms_chunk.reshape(S, K)
 
-        # Compute metrics
-        evm_pct = metrics_mod.evm_rms_percent(ref_syms, Y_eq[use_mask])
-        mse_H = metrics_mod.mse(h_freq, H_est) if model == "tdl" else float("nan")
+            # --- Pilot placement ---
+            tx_grid, pilot_mask, pilot_vals, data_Es, pilot_Es = pilots_mod.place(
+                grid_chunk,
+                spacing=spacing,
+                offset=offset,
+                seed=pil_seed,
+                power_boost_db=pil_boost,
+                power_mode=power_mode,
+            )
+
+            # Derive DATA mask + total mask and bits_per_frame
+            data_mask  = pilots_mod.data_mask_from_pilots(pilot_mask)
+            total_mask = np.logical_or(data_mask, pilot_mask)
+
+            if bits_per_frame is None:
+                n_data_RE = int(np.sum(data_mask))
+                bits_per_frame = n_data_RE * k
+                out["bits_per_frame"] = bits_per_frame
+                if bits_per_frame == 0:
+                    raise RuntimeError("Pilot pattern leaves no data (bits_per_frame=0).")
+
+            # --- Time-domain noise calibration AFTER pilot placement (uses DATA Es) ---
+            sigma_RI = utils.ebn0_db_to_sigma_ofdm_time(
+                ebn0_db=float(ebn0_db),
+                M=int(tx["M"]),
+                code_rate=1.0,
+                nfft=int(of["nfft"]),
+                ifft_norm="numpy",         # matches ofdm.py (IFFT 1/N)
+                Es_sub=float(data_Es),     # DATA per-RE energy post pilot-placement
+            )
+
+            # --- OFDM TX ---
+            x_time = ofdm.tx(tx_grid, nfft=nfft, cp=cp)
+
+            # --- Channel + AWGN ---
+            if model == "flat":
+                h_flat = channel.flat_rayleigh(S=x_time.shape[0], rng=rng_chan).astype(np.complex64)
+                y_nom  = (h_flat[:, None] * x_time).astype(np.complex64)
+                h_freq_true = np.tile(h_flat[:, None], (1, K)).astype(np.complex64)
+            else:  # TDL
+                y_nom = channel.apply_fir_per_symbol(x_time, h_fir).astype(np.complex64)
+                h_freq_true = np.tile(H_full[used_bins], (x_time.shape[0], 1)).astype(np.complex64)
+
+            noise = (rng_noise.normal(scale=sigma_RI, size=x_time.shape) +
+                     1j * rng_noise.normal(scale=sigma_RI, size=x_time.shape)).astype(np.complex64)
+            y_time = (y_nom + noise).astype(np.complex64)
+
+            # --- OFDM RX on used subcarriers (shape [S,K]) ---
+            Y = ofdm.rx(y_time, nfft=nfft, cp=cp, n_subcarriers=K, return_full_grid=False)
+
+            # --- LS on pilot REs ---
+            H_p = np.zeros_like(Y, dtype=np.complex64)
+            H_p[pilot_mask] = (Y[pilot_mask] / pilot_vals[pilot_mask]).astype(np.complex64)
+
+            # --- Interpolate in frequency (+ mild time smoothing) ---
+            H_est = interp_mod.interp_freq_linear(H_p, pilot_mask)
+            H_est = interp_mod.smooth_time_triangular(H_est)
+
+            # --- Fixed frequency-domain noise variance for MMSE (from Eb/N0 + k + η) ---
+            sigma2_fix = ctrl.compute_sigma2_fix(
+                ebn0_db=ebn0_db,
+                use_mask=data_mask,
+                pilots_mask=pilot_mask,
+                total_mask=total_mask,
+            )
+
+            # --- Equalization ---
+            if eq_type == "mmse":
+                Y_eq = mmse_equalize(Y_used=Y, H_est_used=H_est, sigma2=sigma2_fix)
+            else:
+                Y_eq = eq.equalize_zf_robust(Y, H_est)
+
+            # --- Metrics on DATA REs only; accumulate ---
+            if np.any(data_mask):
+                ref_syms = tx_grid[data_mask].astype(np.complex64)
+                y_eq     = Y_eq[data_mask].astype(np.complex64)
+
+                # BER accumulation via hard demap
+                dec_bits = utils.demod(y_eq, M)
+                tx_bits  = utils.demod(ref_syms, M)
+                ctrl.update_counters(bits_tx=tx_bits, bits_hat=dec_bits, use_mask=data_mask)
+
+                # EVM accumulation (RMS at end)
+                e_err = np.abs(y_eq - ref_syms) ** 2
+                e_sig = np.abs(ref_syms) ** 2
+                evm_num += float(np.sum(e_err))
+                evm_den += float(np.sum(e_sig))
+            else:
+                raise RuntimeError("No data REs (all pilots). Check pilots.spacing/offset.")
+
+            # Channel-estimate MSE accumulation (oracle vs estimate on used tones)
+            mse_sum += metrics_mod.mse(h_freq_true, H_est)
+            n_chunks += 1
+
+            # Progress probe (optional)
+            if (n_chunks % 50) == 0:
+                print(f"[{ebn0_db:>4.1f} dB] chunks={n_chunks}  bits={ctrl.total_bits:,}  "
+                      f"errs={ctrl.total_errs:,}  RE={ctrl.used_res_total:,}")
+
+            # --- Autoramp stop: confidence + coverage + min_bits (or max_bits) ---
+            if ctrl.should_stop():
+                break
+
+        # --- Final per-SNR metrics ---
+        ber        = ctrl.total_errs / max(1, ctrl.total_bits)
+        evm_pct    = 100.0 * np.sqrt(evm_num / max(1e-12, evm_den))
+        mse_H      = mse_sum / max(1, n_chunks)
 
         out["snr_db"].append(float(ebn0_db))
-        out["ber"].append(ber)
+        out["ber"].append(float(ber))
         out["evm_percent"].append(float(evm_pct))
-        out["mse_H"].append(mse_H)
+        out["mse_H"].append(float(mse_H))
 
-    # Optional JSON output
+    # Optional JSON dump
     if io.get("write_json", False):
-        path = io.get("out_json", "artifacts/m2_result.json")
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(out, f, indent=2)
-    
-    return out
-# ----------------------------- Public dispatcher --------------------------- #
+      path = io.get("out_json", "artifacts/m2_ofdm_tdlc_autoramp_results.json")
+      Path(path).parent.mkdir(parents=True, exist_ok=True)
+      with open(path, "w") as f:
+          json.dump(out, f, indent=2)
 
+   # Auto-plot block goes HERE (once, after full sweep)
+    do_plot = bool(io.get("plot", False))
+    do_show = bool(io.get("show_plot", False))
+    # Always save a plot if at least one point; stay quiet otherwise.
+    if do_plot and len(out.get("snr_db", [])) >= 1:
+        from nr_urllc.plots import plot_m2_curves
+        eq_type  = str(cfg.get("eq", {}).get("type", "zf")).upper()
+        ch_model = str(cfg.get("channel", {}).get("model", "tdl")).upper()
+        label    = f"M={int(cfg.get('tx',{}).get('M',4))} {ch_model} {eq_type}"
+        out_png  = io.get("out_plot", "artifacts/m2_curves.png")
+        plot_m2_curves(out, label=label, title="M2 — BER / EVM / MSE vs SNR",
+                       save_path=out_png, show=do_show)
+
+    return out
+
+
+
+# ----------------------------- Public dispatcher --------------------------- #
 def run(cfg: dict) -> dict:
     """
     Single public entry: dispatch by cfg['sim']['type'].
     Options:
       - 'baseline_awgn' : run_baseline_awgn(cfg)
       - 'ofdm_awgn'     : run_ofdm_awgn(cfg)
+      - 'ofdm_m2'       : run_ofdm_m2(cfg)
     """
     sim_type = cfg.get("sim", {}).get("type", "baseline_awgn")
     if sim_type == "baseline_awgn":
@@ -455,6 +559,6 @@ def run(cfg: dict) -> dict:
     elif sim_type == "ofdm_awgn":
         return _run_ofdm_awgn_cfg(cfg)
     elif sim_type == "ofdm_m2":
-      return run_ofdm_m2(cfg)
+        return run_ofdm_m2(cfg)
     else:
         raise ValueError(f"Unknown sim.type: {sim_type}")

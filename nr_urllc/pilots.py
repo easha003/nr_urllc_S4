@@ -24,29 +24,27 @@ def place(
     offset: int = 0,
     seed: int = 0,
     power_boost_db: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Insert QPSK pilots into a [S,K] data grid using a comb pattern.
-
-    Args:
-        data_grid: complex array [S, K] of QAM data (will NOT be modified).
-        spacing: every `spacing` subcarriers is a pilot (e.g., 4).
-        offset:  column offset for the comb (e.g., 1 shifts to bins 1,5,9,...).
-        seed:    RNG seed for deterministic pilot symbols across rows.
-        power_boost_db: amplitude boost in dB for pilots (0 = none).
+    power_mode: str = "unconstrained",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """
+    Insert QPSK pilots into a [S,K] data grid using a comb pattern.
 
     Returns:
-        tx_grid: [S, K] grid with pilots inserted (data overwritten at pilot bins)
-        pilot_mask: bool [S, K] True at pilot locations
-        pilot_vals: [S, K] grid with pilots where mask=True, 0 elsewhere
+        tx_grid:   [S,K] grid with pilots inserted
+        pilot_mask:[S,K] True at pilot locations
+        pilot_vals:[S,K] pilots where mask=True, 0 elsewhere
+        data_Es:   per-RE energy of DATA tones after any renormalization
+        pilot_Es:  per-RE energy of PILOT tones after any renormalization
     """
     S, K = data_grid.shape
     cols = comb_indices(K, spacing, offset)
     rng = np.random.default_rng(seed)
 
-    amp = float(10 ** (power_boost_db / 20.0))
-    # Per-row QPSK pilots with optional amplitude boost
+    # Pilot boost (power)
+    b_lin = float(10 ** (power_boost_db / 10.0))
+    amp   = float(np.sqrt(b_lin))
     const = np.array([1+1j, -1+1j, -1-1j, 1-1j], dtype=np.complex64) / np.sqrt(2.0)
-    P = rng.choice(const, size=(S, cols.size)).astype(np.complex64) * amp
+    P     = rng.choice(const, size=(S, cols.size)).astype(np.complex64) * amp
 
     tx_grid = data_grid.astype(np.complex64, copy=True)
     tx_grid[:, cols] = P
@@ -56,7 +54,23 @@ def place(
 
     pilot_vals = np.zeros((S, K), dtype=np.complex64)
     pilot_vals[:, cols] = P
-    return tx_grid, pilot_mask, pilot_vals
+
+    # Power-constrained: keep average per-RE power = 1
+    if str(power_mode).lower() == "constrained":
+        Kp = int(pilot_mask.sum())
+        Kd = int(S * K - Kp)
+        P_avg = (Kd * 1.0 + Kp * b_lin) / float(S * K) if (S * K) > 0 else 1.0
+        scale = 1.0 / np.sqrt(P_avg)
+        tx_grid   *= scale
+        pilot_vals*= scale
+        data_Es   = float(scale**2)
+        pilot_Es  = float(b_lin * scale**2)
+    else:
+        data_Es  = 1.0
+        pilot_Es = float(b_lin)
+
+    return tx_grid, pilot_mask, pilot_vals, data_Es, pilot_Es
+
 
 
 def estimate_ls(Y_used: np.ndarray, pilot_vals: np.ndarray, pilot_mask: np.ndarray) -> np.ndarray:
