@@ -86,8 +86,8 @@ fec:
     lifting_Z: 32
 
 bler:
-  packets_per_snr: 10000000
-  min_errors: 1
+  packets_per_snr: 1000000
+  min_errors: 30
   adaptive_packets: true
 
 io:

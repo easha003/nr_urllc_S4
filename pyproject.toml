@@ -13,7 +13,9 @@ readme = "README.md"
 license = { text = "MIT" }
 dependencies = [
     "numpy",
-    "pytest"
+    "pytest",
+    "pyyaml",
+    "matplotlib"
 ]
 
 [tool.setuptools.packages.find]
