@@ -215,23 +215,45 @@ def _qam_constellation(M):
     bits = _gray_bits(M)
     return const.astype(np.complex128), bits
 
+# nr_urllc/utils.py
 def qam_llr_maxlog(sym_eq: np.ndarray, M: int, sigma2: float) -> np.ndarray:
     """
-    Max-log LLRs per coded bit.
-    sym_eq: equalized symbols, shape (N,)
-    M: constellation size
-    sigma2: noise variance per complex symbol (post-equalization)
-    returns shape (N*log2(M),)
+    Max-log LLRs per coded bit, aligned to utils.mod() bit ordering.
+    QPSK order: [Q-bit, I-bit]
+    16QAM order: [I_MSB, I_LSB, Q_MSB, Q_LSB]
+    sigma2: noise variance per complex symbol (post-FFT/equalization)
     """
-    const, bits = _qam_constellation(M)     # (M,), (M,m)
-    m = bits.shape[1]
-    y = sym_eq.reshape(-1, 1)               # (N,1)
-    d2 = np.abs(y - const.reshape(1, -1)) ** 2
-    llrs = []
-    for b in range(m):
-        mask0 = (bits[:, b] == 0)
-        mask1 = ~mask0
-        d0 = np.min(d2[:, mask0], axis=1)
-        d1 = np.min(d2[:, mask1], axis=1)
-        llrs.append((d1 - d0) / (2.0 * max(sigma2, 1e-12)))
-    return np.stack(llrs, axis=1).reshape(-1)
+    y = np.asarray(sym_eq, dtype=np.complex128).reshape(-1)
+    s2 = float(max(sigma2, 1e-15))
+
+    if M == 4:
+        # QPSK: b0 controls Q, b1 controls I in utils.mod
+        # LLR(b0) ~ (2/sigma2) * Im{y}, LLR(b1) ~ (2/sigma2) * Re{y}
+        scale = 2.0 / s2
+        Lq = y.imag * scale
+        Li = y.real * scale
+        return np.stack([Lq, Li], axis=1).reshape(-1)
+
+    if M == 16:
+        # 4-PAM levels used in utils.mod (normalized by sqrt(10))
+        levels = np.array([+3.0, +1.0, -1.0, -3.0]) / np.sqrt(10.0)
+
+        def pam_llr(x):
+            x = x.astype(np.float64)
+            # MSB (sign): positive set {+3,+1} vs negative set {-1,-3}
+            d_pos = np.minimum((x - levels[0])**2, (x - levels[1])**2)
+            d_neg = np.minimum((x - levels[2])**2, (x - levels[3])**2)
+            L_msb = (d_neg - d_pos) / (2.0 * s2)
+            # LSB (magnitude): outer {±3} vs inner {±1}
+            d_outer = np.minimum((x - levels[0])**2, (x - levels[3])**2)
+            d_inner = np.minimum((x - levels[1])**2, (x - levels[2])**2)
+            L_lsb = (d_inner - d_outer) / (2.0 * s2)
+            return L_msb, L_lsb
+
+        Li_msb, Li_lsb = pam_llr(y.real)  # I axis
+        Lq_msb, Lq_lsb = pam_llr(y.imag)  # Q axis
+        return np.stack([Li_msb, Li_lsb, Lq_msb, Lq_lsb], axis=1).reshape(-1)
+
+    # If you later add higher QAMs, extend similarly to match utils.mod’s bit order.
+    raise ValueError(f"Unsupported M={M}; supported: 4 (QPSK), 16 (16QAM).")
+

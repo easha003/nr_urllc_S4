@@ -7,7 +7,6 @@ import numpy as np
 from . import utils
 from . import ofdm
 from . import fec
-
 # ---------- dataclasses ----------
 
 @dataclass
@@ -334,7 +333,13 @@ def bler_ofdm_sweep(cfg: dict) -> dict:
     nr  = cfg.get("nr", {});   ch = cfg.get("channel", {}); pil = cfg.get("pilots", {})
     io  = cfg.get("io", {});   urc = cfg.get("urllc", {})
 
-    rng_seed = int(sim.get("seed", 0)); rng = utils.get_rng(rng_seed)
+    rng_seed = int(sim.get("seed", 0)); 
+    rng = utils.get_rng(rng_seed)
+
+    # Independent RNGs for different random processes
+    rng_channel = utils.get_rng(rng_seed + 1000)  # For channel generation
+    rng_payload = utils.get_rng(rng_seed + 2000)  # For payload data
+    rng_noise = utils.get_rng(rng_seed + 3000)    # For AWGN noise
 
     M = int(tx.get("M", 4)); k = int(np.log2(M))
     nfft = int(of.get("nfft", 256)); cp = float(of.get("cp", 0.125))
@@ -343,48 +348,81 @@ def bler_ofdm_sweep(cfg: dict) -> dict:
 
     spacing = int(pil.get("spacing", 4)); offset = int(pil.get("offset", 0))
     pseed = int(pil.get("seed", 123)); boost = float(pil.get("power_boost_db", 0.0))
-    pmode = str(pil.get("power_mode", "unconstrained"))
+    pmode = str(pil.get("power_mode", "constrained"))
+
+    # Add warning for unconstrained mode
+    if pmode.lower() == "unconstrained":
+        print("[WARNING] Using 'unconstrained' pilot power mode. This violates power regulations!")
+        print("          Consider using 'power_mode: constrained' for realistic results.")
 
     app_bytes = int(urc.get("app_payload_bytes", 32) or 32)
     tb_bytes = int(urc.get("tb_payload_bytes", app_bytes + 16))
 
     snr_list = ch.get("snr_db_list", [0, 2, 4, 6, 8, 10])
-    packets_per_snr = int(cfg.get("bler", {}).get("packets_per_snr", 400))
+    base_packets_per_snr = int(cfg.get("bler", {}).get("packets_per_snr", 400))
     min_errors = int(cfg.get("bler", {}).get("min_errors", 20))
 
     tmp = np.zeros((1, K), dtype=np.complex64)
     _grid1, pilot_mask1, pilot_vals1, data_Es1, pilot_Es1 = pilots_mod.place(
         tmp, spacing, offset=offset, seed=pseed, power_boost_db=boost, power_mode=pmode
     )
+   
     pilots_per_sym = int(pilot_mask1[0].sum()); data_RE_per_sym = K - pilots_per_sym
     if data_RE_per_sym <= 0:
         raise RuntimeError("Pilot pattern leaves no data REs")
 
+    # In bler_ofdm_sweep, after pilot placement:
+    print(f"[INFO] Pilot power mode: {pmode}")
+    print(f"       Data RE energy scaling: {data_Es1:.4f} ({10*np.log10(data_Es1):.2f} dB)")
+    print(f"       Pilot RE energy: {pilot_Es1:.4f} ({10*np.log10(pilot_Es1):.2f} dB)")
+    if pmode.lower() == "unconstrained":
+        total_power = (pilots_per_sym * pilot_Es1 + data_RE_per_sym * data_Es1) / K
+        print(f"       Total TX power: {total_power:.4f} ({10*np.log10(total_power):.2f} dB) - EXCEEDS LIMIT!")
+    
+    # ADD: Adaptive scaling based on expected BLER
+    adaptive_packets = cfg.get("bler", {}).get("adaptive_packets", True)
+    data_Es_actual = data_Es1
     bler = []; packets = []
     for i_snr, snr_db in enumerate(snr_list):
-
-        model = str(ch.get("model", "tdl")).lower()
-        if model == "tdl":
-            prof = ch.get("tdl", {})
-            delays = prof.get("delays", [0,3,5])
-            powers_db = prof.get("powers_db", [0.0, -3.0, -6.0])
-            h_fir = channel.tdl_fir_from_profile(delays, powers_db, rng=rng)
-        elif model == "cdl":
-            prof = ch.get("cdl", {})
-            profile_name = str(prof.get("profile", "C")).upper()
-            scale_samples = int(prof.get("scale_samples", 0)) or None
-            k_db = prof.get("k_db", None)
-            k_db = float(k_db) if k_db is not None else None
-            h_fir = channel.cdl_fir(profile=profile_name, ncp=Ncp, scale_samples=scale_samples, rice_k_db=k_db, rng=rng)
+        
+        # Adaptively increase packets for high SNR
+        if adaptive_packets and i_snr > 0 and len(bler) > 0:
+            # Estimate required packets based on previous BLER
+            last_bler = bler[-1]
+            if last_bler > 0:
+                # Target 100 errors: packets = 100 / expected_bler
+                estimated_packets = int(min_errors / (last_bler * 0.3))  # 0.3 = aggressive factor
+                packets_per_snr = min(max(base_packets_per_snr, estimated_packets), 100000)
+            else:
+                packets_per_snr = base_packets_per_snr * 10  # 10x if previous was zero
         else:
-            h_fir = np.array([1.0+0j], dtype=np.complex64)
-
-        if (len(h_fir) - 1) > Ncp:
-            raise ValueError(f"CP too short: L-1={len(h_fir)-1} > Ncp={Ncp}")
+            packets_per_snr = base_packets_per_snr
+        
+        print(f"[INFO] SNR {snr_db} dB: Running up to {packets_per_snr} packets")
 
         n_fail = 0; n_sent = 0
         while n_sent < packets_per_snr and n_fail < min_errors:
-            payload = rng.integers(0, 256, size=tb_bytes, dtype=np.uint8).tobytes()
+            model = str(ch.get("model", "tdl")).lower()
+            if model == "tdl":
+                prof = ch.get("tdl", {})
+                delays = prof.get("delays", [0,3,5])
+                powers_db = prof.get("powers_db", [0.0, -3.0, -6.0])
+                h_fir = channel.tdl_fir_from_profile(delays, powers_db, rng=rng_channel)
+            elif model == "cdl":
+                prof = ch.get("cdl", {})
+                profile_name = str(prof.get("profile", "C")).upper()
+                scale_samples = int(prof.get("scale_samples", 0)) or None
+                k_db = prof.get("k_db", None)
+                k_db = float(k_db) if k_db is not None else None
+                h_fir = channel.cdl_fir(profile=profile_name, ncp=Ncp, scale_samples=scale_samples, rice_k_db=k_db, rng=rng_channel)
+            else:
+                h_fir = np.array([1.0+0j], dtype=np.complex64)
+
+            if (len(h_fir) - 1) > Ncp:
+                raise ValueError(f"CP too short: L-1={len(h_fir)-1} > Ncp={Ncp}")
+
+            
+            payload = rng_payload.integers(0, 256, size=tb_bytes, dtype=np.uint8).tobytes()
             tb = append_crc(payload); tb_bits = bytes_to_bits(tb); Lbits = len(tb_bits)
             # --- FEC encode (optional) ---
             fec_cfg = cfg.get('fec', {})
@@ -423,30 +461,8 @@ def bler_ofdm_sweep(cfg: dict) -> dict:
             y_c = channel.apply_fir_per_symbol(x, h_fir)
 
             sigma_RI = utils.ebn0_db_to_sigma_ofdm_time(
-                snr_db, M=M, code_rate=fec.get_rate(fec_cfg), nfft=nfft, ifft_norm="numpy", Es_sub=1.0
+                snr_db, M=M, code_rate=fec.get_rate(fec_cfg), nfft=nfft, ifft_norm="numpy", Es_sub=data_Es_actual
             )
-
-            # New noise on each HARQ attempt
-            noise = rng.normal(0.0, sigma_RI, y_c.shape) + 1j * rng.normal(0.0, sigma_RI, y_c.shape)
-            y = y_c + noise
-
-            # Receiver per attempt
-            Y = ofdm.rx(y, nfft=nfft, cp=cp, n_subcarriers=K)
-
-            # Channel estimation using pilots (noise-affected per attempt)
-            H_p = np.zeros_like(Y, dtype=np.complex64)
-            mask = pilot_mask
-            H_p[mask] = (Y[mask] / (pilot_vals[mask] + 1e-12)).astype(np.complex64)
-            H_est = interp_mod.interp_freq_linear(H_p, mask)
-            H_est = interp_mod.smooth_time_triangular(H_est)
-
-            # MMSE equalization
-            sigma2 = float(2.0 * (sigma_RI ** 2))  # complex noise variance
-            Y_eq = eq.equalize_mmse_robust(Y, H_est, float(sigma2), 1e-12)
-
-            # Equalized data symbols
-            y_data = Y_eq[data_mask].reshape(-1)
-
 
             # --- Timely BLER + HARQ (Chase) with soft LLR + soft LDPC ---
             from . import nr_timing
@@ -481,13 +497,35 @@ def bler_ofdm_sweep(cfg: dict) -> dict:
             while True:
                 attempts += 1
 
+
+                # New noise on each HARQ attempt
+                noise = rng_noise.normal(0.0, sigma_RI, y_c.shape) + 1j * rng_noise.normal(0.0, sigma_RI, y_c.shape)
+                y = y_c + noise
+
+                # Receiver per attempt
+                Y = ofdm.rx(y, nfft=nfft, cp=cp, n_subcarriers=K)
+
+                # Channel estimation using pilots (noise-affected per attempt)
+                H_p = np.zeros_like(Y, dtype=np.complex64)
+                mask = pilot_mask
+                H_p[mask] = (Y[mask] / (pilot_vals[mask] + 1e-12)).astype(np.complex64)
+                H_est = interp_mod.interp_freq_linear(H_p, mask)
+                H_est = interp_mod.smooth_time_triangular(H_est)
+
+                # MMSE equalization
+                sigma2 = float(2.0 * (sigma_RI ** 2)*nfft)  # complex noise variance
+                Y_eq = eq.equalize_mmse_robust(Y, H_est, float(sigma2), 1e-12)
+
+                # Equalized data symbols
+                y_data = Y_eq[data_mask].reshape(-1)
+
                 # Post-eq noise variance per complex symbol for LLRs.
                 # (sigma_RI is your per-real/imag std you already computed for AWGN)
-                sigma2_llr = float(sigma_RI ** 2)
+                sigma2_llr = sigma2
 
                 # Soft LLRs from equalized symbols (trim to coded length)
                 llr_cur = utils.qam_llr_maxlog(y_data, M, sigma2=sigma2_llr)
-                llr_cur = llr_cur[: Lcode * m_bits]
+                llr_cur = llr_cur[: Lcode]
 
                 # HARQ Chase combining (LLR addition)
                 if harq_enabled and combining == "chase":
@@ -515,6 +553,12 @@ def bler_ofdm_sweep(cfg: dict) -> dict:
             if not ok:
                 n_fail += 1
             n_sent += 1
+
+            # Progress report every 1000 packets
+            if n_sent % 1000 == 0:
+                current_bler = n_fail / n_sent if n_sent > 0 else 0
+                print(f"  Progress: {n_sent}/{packets_per_snr} packets, "
+                      f"{n_fail} errors, BLER={current_bler:.2e}")
             # --- end timely BLER block ---
 
 
