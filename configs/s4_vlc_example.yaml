@@ -161,7 +161,7 @@ io:
   out_heatmap: artifacts/s4/s4_vlc_timely_heatmap.png
 
 bler:
-  packets_per_snr: 2000     # ↑ was ~20; raise to 2k–10k to calm variance
+  packets_per_snr: 8000     # ↑ was ~20; raise to 2k–10k to calm variance
   min_errors: 200           # ↑ collect enough errors for stable estimates
   # max_packets_per_snr: 100000   # (optional) safety cap if you want one
 
