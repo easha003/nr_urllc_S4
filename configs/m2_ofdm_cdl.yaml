@@ -18,12 +18,12 @@ pilots:
 channel:
   model: cdl
   snr_db_list:
+  - 0.0
+  - 2.0
+  - 4.0
   - 6.0
   - 8.0
   - 10.0
-  - 12.0
-  - 14.0
-  - 16.0
   seed: 2025
   cdl:
     profile: C
