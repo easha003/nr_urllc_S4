@@ -264,7 +264,8 @@ def autoramp_ofdm_m2_sweep(
         total_bits = 0
         total_errs = 0
         n_bits_try = max(min_bits, bits_per_frame)
-        
+        snr_seed = seed0 + idx * 12345 
+
         # Track latest EVM/MSE measured at this SNR
         last_evm_percent = float("nan")
         last_mse_H = float("nan")
@@ -277,12 +278,12 @@ def autoramp_ofdm_m2_sweep(
             # grow n_bits each repetition, but simulate.py will round/pad to whole frames
             cfg["tx"]["n_bits"] = int(n_bits_try)
             # vary seed so repetitions are independent
-            cfg["sim"]["seed"] = int(rng_run.integers(0, 2**31 - 1))
+            
             # Disable plotting & JSON during inner autoramp reps
             cfg.setdefault("io", {})["plot"] = False
             cfg["io"]["show_plot"] = False
             cfg["io"]["write_json"] = False
-
+            cfg["sim"]["seed"] = snr_seed
             res = simulate.run(cfg)  # expects "ber": [value] for this single SNR
             ber = float(res["ber"][0])
             # Pull EVM% and MSE from the M2 single-SNR result (use the first point)
