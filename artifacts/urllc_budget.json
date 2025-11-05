@@ -6,9 +6,9 @@
   "radio_deadline_ms": 3.0,
   "nr": {
     "mu": 2,
-    "minislot_symbols": 7,
+    "minislot_symbols": 14,
     "cp": 0.125,
-    "tti_ms": 0.13125,
+    "tti_ms": 0.2625,
     "cg_ul": {
       "period_ms": 1.0,
       "K": 2,
@@ -26,9 +26,9 @@
     "mdbv_bytes": 1354
   },
   "tries": {
-    "max_tries_by_deadline": 22,
-    "n_independent_tries": 22,
-    "bler_per_try_target": 4.545671501765547e-06
+    "max_tries_by_deadline": 11,
+    "n_independent_tries": 11,
+    "bler_per_try_target": 9.091322340393226e-06
   },
   "notes": {
     "formula": "per_try = 1 - (1 - PER_target)^(1 / N_tries) with N_tries <= floor(deadline/TTI)",

@@ -11,7 +11,7 @@ class AutorampController:
       • Computes fixed sigma^2 from Eb/N0, k, and efficiency eta per chunk
     """
 
-    def __init__(self, cfg: dict, M: int, nfft: int, cp_frac: float):
+    def __init__(self, cfg: dict, M: int, nfft: int, cp_frac: float, current_snr_db: float = None):
         self.cfg     = cfg
         self.M       = int(M)
         self.k       = int(np.log2(self.M))
@@ -24,9 +24,22 @@ class AutorampController:
         self.min_used_res  = int(ar_cfg.get("min_used_res", 2_000_000))
         self.max_bits      = int(ar_cfg.get("max_bits", 10_000_000))
         self.noise_blend_w = float(ar_cfg.get("noise_blend_weight", 0.0))  # keep 0.0
+    
+        base_target = int(ar_cfg.get("target_errs", 200))
+        
+        # Scale target errors based on SNR (more errors needed in transition region)
+        if current_snr_db is not None:
+            if 8 <= current_snr_db <= 16:  # Transition region
+                self.target_errs = base_target * 3  # 3x more errors
+            elif current_snr_db > 16:  # High SNR (low BER)
+                self.target_errs = max(base_target // 2, 50)  # Can use fewer
+            else:  # Low SNR (high BER)
+                self.target_errs = base_target
+        else:
+            self.target_errs = base_target
 
-        # Scale min_bits so the number of REs is ~constant across M
-        # Ref = QPSK -> log2(4) = 2
+            # Scale min_bits so the number of REs is ~constant across M
+            # Ref = QPSK -> log2(4) = 2
         self.min_bits_eff = int(self.base_min_bits * (2.0 / max(1, self.k)))
 
         self.reset_counters()

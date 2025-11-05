@@ -8,19 +8,19 @@ tx:
 
 ofdm:
   nfft: 256
-  n_subcarriers: 120
+  n_subcarriers: 192
   cp: 0.125
-  minislot_symbols: 7
+  minislot_symbols: 14
 
 # Optional, explicit numerology block (your code also reads nr/ofdm if this is absent)
 numerology:
   mu: 2
-  L_symbols: 7
+  L_symbols: 14
   cp_fraction: 0.125
 
 nr:
   mu: 2
-  minislot_symbols: 7
+  minislot_symbols: 14
   dmrs:
     freq_density: 3
     offset_sc: 0
@@ -43,18 +43,7 @@ pilots:
 
 channel:
   model: tdl
-  snr_db_list:
-    - 0
-    - 2
-    - 4
-    - 6
-    - 8
-    - 12
-    - 16
-    - 18
-    - 20
-    - 22
-    - 24
+  snr_db_list: [0, 4, 8, 12, 16, 20, 24]
   tdl:
     delays: [0, 2, 4, 6]
     powers_db: [0.0, -2.5, -5.5, -9.0]
@@ -85,17 +74,17 @@ fec:
     lifting_Z: 32
 
 autoramp:
-  target_errs: 200
-  base_min_bits: 200000
-  min_used_res: 2000000
-  max_bits: 2000000
+  target_errs: 1000
+  base_min_bits: 500000
+  min_used_res: 5000000
+  max_bits: 20000000
   noise_blend_weight: 0.0
-  min_bits: 100000
-  growth: 2.0
+  min_bits: 400000
+  growth: 3.0
   
 bler:
   packets_per_snr: 100000
-  min_errors: 30
+  min_errors: 100
   adaptive_packets: true
 
 io:

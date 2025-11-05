@@ -26,7 +26,7 @@ ofdm:
   nfft: 256
   cp: 0.125  # Cyclic prefix as fraction of symbol time
   n_subcarriers: 64
-  minislot_symbols: 7  # Number of OFDM symbols per mini-slot
+  minislot_symbols: 14  # Number of OFDM symbols per mini-slot
 
 # ============================================================================
 # PILOT CONFIGURATION (Shared with RF)
@@ -84,7 +84,7 @@ nr:
          # 2: 60 kHz (recommended for URLLC)
          # 3: 120 kHz
   
-  minislot_symbols: 7  # Symbols per mini-slot (typically 2, 4, 7, or 14)
+  minislot_symbols: 14  # Symbols per mini-slot (typically 2, 4, 7, or 14)
   
   cg_ul:  # Configured Grant uplink (for reference)
     period_ms: 1.0

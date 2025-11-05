@@ -1,4 +1,5 @@
 import argparse, yaml, json, copy
+import numpy as np
 from nr_urllc import simulate
 from nr_urllc import urllc as urllc_mod
 from nr_urllc import nr_timing as nr_time_mod
@@ -225,26 +226,69 @@ def main():
         # ---- OPTIONAL DIAGNOSTIC ADD-ON (no new files) ----
         # Append EVM/MSE per SNR by running a light, non-autoramp pass per SNR
         # using the same numerology/pilots/equalizer.
-        evm_curve, mseH_curve = [], []
-        # choose a small but stable diagnostic bit budget
-        diag_bits = max(int(auto.get("min_bits", 50_000)) * 4, 200_000)
-        for snr in result.get("snr_db", []):
-            cfg2 = copy.deepcopy(cfg)
-            cfg2.setdefault("sim", {})["autoramp"] = False
-            cfg2.setdefault("channel", {})["snr_db_list"] = [float(snr)]
-            cfg2.setdefault("tx", {})["n_bits"] = int(diag_bits)
+        
+        import numpy as np  # Add this import at the top if not already there
+        
+        evm_curve = []  # Initialize the lists BEFORE the loop
+        mseH_curve = []
+        
+        print("\n[EVM/MSE Diagnostic] Running enhanced diagnostic sweeps...")
+        
+        for snr in result.get("snr_db", []):  # Loop over each SNR point
+            # SNR-adaptive bit budget: more bits at high SNR where variance is larger
+            if snr >= 16:
+                diag_bits = 2_000_000
+            elif snr >= 10:
+                diag_bits = 1_000_000
+            else:
+                diag_bits = 500_000
+
+            n_diagnostic_runs = 5  # More runs = smoother curve
+            evm_samples = []
+            mse_samples = []
             
-            # CRITICAL: don't let the per-SNR diagnostic runs clobber your final JSON
-            cfg2.setdefault("io", {})["write_json"] = False
-            cfg2["io"]["plot"] = False
-            cfg2["io"]["show_plot"] = False
+            print(f"  SNR={snr:.1f} dB: Running {n_diagnostic_runs} diagnostic runs with {diag_bits:,} bits each...")
+
+            for run_idx in range(n_diagnostic_runs):
+                cfg2 = copy.deepcopy(cfg)
+                cfg2.setdefault("sim", {})["autoramp"] = False
+                cfg2.setdefault("channel", {})["snr_db_list"] = [float(snr)]
+                cfg2.setdefault("tx", {})["n_bits"] = int(diag_bits)
+                cfg2.setdefault("io", {})["write_json"] = False
+                cfg2["io"]["plot"] = False
+                cfg2["io"]["show_plot"] = False
+                
+                # IMPORTANT: Use different seed for each run
+                base_seed = cfg.get("sim", {}).get("seed", 0)
+                cfg2["sim"]["seed"] = base_seed + run_idx + int(snr * 1000)
+                
+                r2 = simulate.run(cfg2)
+                evm_val = r2.get("evm_percent", [float("nan")])
+                mse_val = r2.get("mse_H", [float("nan")])
+                
+                # Handle both list and scalar returns
+                if isinstance(evm_val, list):
+                    evm_val = evm_val[0] if len(evm_val) > 0 else float("nan")
+                if isinstance(mse_val, list):
+                    mse_val = mse_val[0] if len(mse_val) > 0 else float("nan")
+                
+                evm_samples.append(float(evm_val))
+                mse_samples.append(float(mse_val))
+
+            # Take median (more robust than mean to outliers)
+            evm_median = float(np.median(evm_samples))
+            mse_median = float(np.median(mse_samples))
             
-            r2 = simulate.run(cfg2)  # expects arrays: evm_percent, mse_H (and ber)
-            evm_curve.append(float(r2.get("evm_percent", [float("nan")])[0]))
-            mseH_curve.append(float(r2.get("mse_H", [float("nan")])[0]))
+            print(f"    → EVM: {evm_median:.2f}% (samples: {[f'{x:.1f}' for x in evm_samples]})")
+            print(f"    → MSE: {mse_median:.6f}")
+            
+            evm_curve.append(evm_median)
+            mseH_curve.append(mse_median)
 
         result["evm_percent"] = evm_curve  # EVM in %
         result["mse_H"] = mseH_curve
+        
+        print("[EVM/MSE Diagnostic] Complete!\n")
 
     # ---------------------------------------
     # NON-AUTORAMP PATH (all modes supported)
