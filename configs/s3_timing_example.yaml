@@ -10,7 +10,7 @@ sim:
 # NR Numerology and mini-slot configuration
 nr:
   mu: 2                          # SCS numerology: 0=15kHz, 1=30kHz, 2=60kHz, etc.
-  minislot_symbols: 14            # L: number of symbols per mini-slot (typical: 2,4,7,14)
+  minislot_symbols: 7            # L: number of symbols per mini-slot (typical: 2,4,7,14)
   
   cg_ul:                         # Contention-based uplink grant parameters
     period_ms: 1.0               # CG period (informational; not used in S3 latency model yet)
@@ -27,7 +27,7 @@ ofdm:
   nfft: 256
   cp: 0.125                      # Cyclic prefix as fraction of useful symbol time
   n_subcarriers: 64
-  minislot_symbols: 14
+  minislot_symbols: 7
 
 # Pilot configuration (for channel estimation)
 pilots:

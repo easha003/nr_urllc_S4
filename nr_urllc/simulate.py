@@ -4,6 +4,7 @@ import json
 import numpy as np
 from pathlib import Path
 import math as m
+import copy
 
 from . import utils, ofdm, channel, fec
 from . import pilots as pilots_mod
@@ -542,8 +543,6 @@ def run_ofdm_m2(cfg: dict) -> dict:
 
     return out
 
-
-
 # ----------------------------- Public dispatcher --------------------------- #
 def run(cfg: dict) -> dict:
     """
@@ -552,8 +551,18 @@ def run(cfg: dict) -> dict:
       - 'baseline_awgn' : run_baseline_awgn(cfg)
       - 'ofdm_awgn'     : run_ofdm_awgn(cfg)
       - 'ofdm_m2'       : run_ofdm_m2(cfg)
+      - 'm2_then_bler'  : (alias → 'ofdm_m2' for PHY-stage calls)
     """
     sim_type = cfg.get("sim", {}).get("type", "baseline_awgn")
+    sim_type = str(sim_type).lower()  # normalize
+
+    # --- alias composite → phy handler (local deepcopy; caller cfg untouched) ---
+    if sim_type == "m2_then_bler":
+        cfg = copy.deepcopy(cfg)
+        cfg["sim"]["type"] = "ofdm_m2"
+        sim_type = "ofdm_m2"
+    # ---------------------------------------------------------------------------
+
     if sim_type == "baseline_awgn":
         return run_baseline_awgn(cfg)
     elif sim_type == "ofdm_awgn":
@@ -562,3 +571,4 @@ def run(cfg: dict) -> dict:
         return run_ofdm_m2(cfg)
     else:
         raise ValueError(f"Unknown sim.type: {sim_type}")
+

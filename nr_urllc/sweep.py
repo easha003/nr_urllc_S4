@@ -1,6 +1,6 @@
 # nr_urllc/sweep.py
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Callable, Optional
 import math
 import numpy as np
@@ -15,6 +15,8 @@ class SweepPoint:
     n_bits: int
     n_errs: int
     ber: float
+    evm_percent: float= float("nan") # <-- default so other sweep helpers still work
+    mse_H: float= float("nan")
 
 @dataclass
 class SweepResult:
@@ -23,16 +25,29 @@ class SweepResult:
     points: List[SweepPoint]
 
     @property
-    def ber_curve(self) -> Dict[str, float]:
-        return {f"{p.snr_db:.1f}": p.ber for p in self.points}
+    def snr_db(self) -> List[float]:
+        return [p.snr_db for p in self.points]
 
     @property
-    def n_bits_curve(self) -> Dict[str, int]:
-        return {f"{p.snr_db:.1f}": p.n_bits for p in self.points}
+    def ber_curve(self) -> List[float]:
+        return [p.ber for p in self.points]
 
     @property
-    def n_errs_curve(self) -> Dict[str, int]:
-        return {f"{p.snr_db:.1f}": p.n_errs for p in self.points}
+    def evm_curve(self) -> List[float]:
+        return [p.evm_percent for p in self.points]
+
+    @property
+    def mse_curve(self) -> List[float]:
+        return [p.mse_H for p in self.points]
+
+    @property
+    def n_bits_curve(self) -> List[int]:
+        return [p.n_bits for p in self.points]
+
+    @property
+    def n_errs_curve(self) -> List[int]:
+        return [p.n_errs for p in self.points]
+
 
 
 # ---------- theory helpers (array-safe) ----------
@@ -207,20 +222,6 @@ from copy import deepcopy
 from . import simulate
 from .pilots import comb_indices
 
-@dataclass
-class SweepResult:
-    success: bool
-    meta: Dict[str, Any]
-    points: List[SweepPoint]
-
-    @property
-    def snr_db(self): return [p.snr_db for p in self.points]
-    @property
-    def ber_curve(self): return [p.ber for p in self.points]
-    @property
-    def n_bits_curve(self): return [p.n_bits for p in self.points]
-    @property
-    def n_errs_curve(self): return [p.n_errs for p in self.points]
 
 def _bits_per_frame_M2(cfg: Dict[str, Any]) -> int:
     """Compute DATA bits per frame (payload only) for M2."""
@@ -263,6 +264,10 @@ def autoramp_ofdm_m2_sweep(
         total_bits = 0
         total_errs = 0
         n_bits_try = max(min_bits, bits_per_frame)
+        
+        # Track latest EVM/MSE measured at this SNR
+        last_evm_percent = float("nan")
+        last_mse_H = float("nan")
 
         rep = 0
         while total_bits < max_bits and total_errs < target_errs:
@@ -280,6 +285,17 @@ def autoramp_ofdm_m2_sweep(
 
             res = simulate.run(cfg)  # expects "ber": [value] for this single SNR
             ber = float(res["ber"][0])
+            # Pull EVM% and MSE from the M2 single-SNR result (use the first point)
+            try:
+                evm_seq = res.get("evm_percent", [])
+                last_evm_percent = float(evm_seq[0] if isinstance(evm_seq, (list, tuple, np.ndarray)) else evm_seq)
+            except Exception:
+                pass
+            try:
+                mse_seq = res.get("mse_H", [])
+                last_mse_H = float(mse_seq[0] if isinstance(mse_seq, (list, tuple, np.ndarray)) else mse_seq)
+            except Exception:
+                pass
 
             # infer evaluated bits = full frames worth (simulate pads/wraps)
             frames = int(math.ceil(n_bits_try / bits_per_frame))
@@ -303,7 +319,14 @@ def autoramp_ofdm_m2_sweep(
           ber_hat = 0.0    # keep field for backwards-compat
         #  ber_ub  = 1.0 / max(total_bits, 1)  # optional: add this in the result dict
 
-        points.append(SweepPoint(snr_db=float(snr), n_bits=total_bits, n_errs=total_errs, ber=ber_hat))
+        points.append(SweepPoint(
+            snr_db=float(snr),
+            n_bits=total_bits,
+            n_errs=total_errs,
+            ber=ber_hat,
+            evm_percent=last_evm_percent,
+            mse_H=last_mse_H,
+        ))
 
     meta = {
         "mode": "ofdm_m2",

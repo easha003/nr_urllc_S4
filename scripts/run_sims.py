@@ -113,16 +113,11 @@ def main():
         if use_autoramp:
             # Reuse autoramp M2 path
             res_auto = autoramp_ofdm_m2_sweep(
-                snr_db_list=ch["snr_db_list"],
-                seed=sim_cfg["seed"],
-                M=tx_cfg.get("M", 4),
-                nfft=ofdm["nfft"],
-                cp=ofdm["cp"],
-                n_subcarriers=ofdm["n_subcarriers"],
-                minislot_symbols=ofdm["minislot_symbols"],
-                target_errs=auto.get("target_errs", 100),
-                min_bits=auto.get("min_bits", 20_000),
-                max_bits=auto.get("max_bits", 2_000_000),
+                cfg,
+                target_errs=auto.get("target_errs", 200),
+                min_bits=auto.get("min_bits", 50_000),
+                max_bits=auto.get("max_bits", 10_000_000),
+                growth=auto.get("growth", 2.0),
             )
             m2_result = {
                 "success": res_auto.success, "snr_db": res_auto.snr_db, "ber": res_auto.ber_curve,
