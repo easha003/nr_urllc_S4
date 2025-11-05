@@ -1,7 +1,7 @@
 sim:
   type: m2_then_bler
   seed: 44
-  autoramp: false
+  autoramp: true
 
 tx:
   M: 4
@@ -44,7 +44,6 @@ pilots:
 channel:
   model: tdl
   snr_db_list:
-    - -2
     - 0
     - 2
     - 4
@@ -85,8 +84,17 @@ fec:
     # base_graph_path: path/to/bg.json
     lifting_Z: 32
 
+autoramp:
+  target_errs: 200
+  base_min_bits: 200000
+  min_used_res: 2000000
+  max_bits: 2000000
+  noise_blend_weight: 0.0
+  min_bits: 100000
+  growth: 2.0
+  
 bler:
-  packets_per_snr: 1000000
+  packets_per_snr: 100000
   min_errors: 30
   adaptive_packets: true
 

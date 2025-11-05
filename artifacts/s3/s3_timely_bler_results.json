@@ -454,12 +454,12 @@
   ],
   "timing_summary": {
     "mu": 2,
-    "L_symbols": 7,
+    "L_symbols": 14,
     "k1_symbols": 1,
     "scs_khz": 60.0,
-    "attempt_latency_ms": 0.33333333333333337,
+    "attempt_latency_ms": 0.45,
     "radio_deadline_ms": 3.0,
-    "K_max_by_deadline": 7,
+    "K_max_by_deadline": 5,
     "inter_attempt_gap_ms": 0.1,
     "proc_margin_ms": 0.2
   }
